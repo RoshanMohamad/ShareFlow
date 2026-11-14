@@ -37,6 +37,11 @@ public final class Payload {
             return this;
         }
 
+        public Writer writeBytes(byte[] b) {
+            out.writeBytes(b);
+            return this;
+        }
+
         public byte[] toBytes() { return out.toByteArray(); }
     }
 
@@ -53,6 +58,13 @@ public final class Payload {
         public long readLong() throws IOException {
             need(8);
             return buf.getLong();
+        }
+
+        public byte[] readBytes(int n) throws IOException {
+            need(n);
+            byte[] b = new byte[n];
+            buf.get(b);
+            return b;
         }
 
         public String readString() throws IOException {

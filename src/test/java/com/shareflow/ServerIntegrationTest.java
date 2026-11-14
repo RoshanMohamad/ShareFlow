@@ -27,6 +27,7 @@ import com.shareflow.client.DownloadTask;
 import com.shareflow.client.UploadTask;
 import com.shareflow.common.FileEntry;
 import com.shareflow.common.FrameCodec;
+import com.shareflow.common.Hashing;
 import com.shareflow.common.MessageType;
 import com.shareflow.common.Payload;
 import com.shareflow.common.UserInfo;
@@ -115,8 +116,9 @@ class ServerIntegrationTest {
         assertEquals("big.bin", fb.name());
 
         Path dest = tmp.resolve("copy.bin");
-        DownloadTask.download("127.0.0.1", port, b.sessionId(), id, dest, (d, t) -> { }, () -> false);
+        assertTrue(DownloadTask.download("127.0.0.1", port, b.sessionId(), id, dest, (d, t) -> { }, () -> false));
         assertArrayEquals(sha(src), sha(dest));
+        assertArrayEquals(sha(src), fb.sha256());
 
         try (Stream<Path> s = Files.list(shared)) {
             assertTrue(s.noneMatch(p -> p.toString().endsWith(".part")));
@@ -138,7 +140,8 @@ class ServerIntegrationTest {
         // raw client sending a hostile file name
         try (SocketChannel ch = SocketChannel.open(new InetSocketAddress("127.0.0.1", port))) {
             FrameCodec.writeFrame(ch, MessageType.UPLOAD_START, Payload.writer()
-                    .writeInt(a.sessionId()).writeString("../../evil.txt").writeLong(3).toBytes());
+                    .writeInt(a.sessionId()).writeString("../../evil.txt").writeLong(3)
+                    .writeBytes(Hashing.sha256().digest("abc".getBytes())).toBytes());
             ch.write(ByteBuffer.wrap("abc".getBytes()));
             assertEquals(MessageType.UPLOAD_DONE, FrameCodec.readFrame(ch).type());
         }
@@ -154,7 +157,8 @@ class ServerIntegrationTest {
 
         try (SocketChannel ch = SocketChannel.open(new InetSocketAddress("127.0.0.1", port))) {
             FrameCodec.writeFrame(ch, MessageType.UPLOAD_START, Payload.writer()
-                    .writeInt(a.sessionId()).writeString("half.bin").writeLong(10_000_000).toBytes());
+                    .writeInt(a.sessionId()).writeString("half.bin").writeLong(10_000_000)
+                    .writeBytes(new byte[32]).toBytes());
             ch.write(ByteBuffer.wrap(new byte[100_000]));
             long deadline = System.currentTimeMillis() + 3000;
             while (!Files.exists(shared.resolve("half.bin.part")) && System.currentTimeMillis() < deadline) {
@@ -180,6 +184,76 @@ class ServerIntegrationTest {
     void udpDiscoveryFindsServer() throws Exception {
         var found = DiscoveryClient.discover(server.udpPort(), true);
         assertTrue(found.stream().anyMatch(s -> s.port() == port && s.name().equals("TestServer")), found.toString());
+    }
+
+    @Test
+    void uploadWithWrongHashIsRejectedAndNothingIsAdded() throws Exception {
+        ClientConnection a = ClientConnection.connect("127.0.0.1", port, "alice", new Events());
+        try (SocketChannel ch = SocketChannel.open(new InetSocketAddress("127.0.0.1", port))) {
+            FrameCodec.writeFrame(ch, MessageType.UPLOAD_START, Payload.writer()
+                    .writeInt(a.sessionId()).writeString("bad.txt").writeLong(3)
+                    .writeBytes(new byte[32]).toBytes()); // hash of nothing useful
+            ch.write(ByteBuffer.wrap("abc".getBytes()));
+            var reply = FrameCodec.readFrame(ch);
+            assertEquals(MessageType.ERROR, reply.type());
+            assertTrue(new Payload.Reader(reply.payload()).readString().contains("Integrity"));
+        }
+        Thread.sleep(200);
+        try (Stream<Path> s = Files.list(shared)) {
+            assertEquals(0, s.count(), "no file and no .part may remain");
+        }
+        a.close();
+    }
+
+    @Test
+    void oversizedUploadIsRejected() throws Exception {
+        EventLoop small = new EventLoop(0, 0, "Small", tmp.resolve("small"), 1000, 50);
+        Thread t = new Thread(small, "small-loop");
+        t.start();
+        try {
+            ClientConnection a = ClientConnection.connect("127.0.0.1", small.tcpPort(), "alice", new Events());
+            Path f = tmp.resolve("toobig.bin");
+            Files.write(f, new byte[5000]);
+            IOException e = assertThrows(IOException.class, () ->
+                    UploadTask.upload("127.0.0.1", small.tcpPort(), a.sessionId(), f, (d, x) -> { }, () -> false));
+            assertTrue(e.getMessage().contains("too large"), e.getMessage());
+            a.close();
+        } finally {
+            small.stop();
+            t.join(5000);
+        }
+    }
+
+    @Test
+    void connectionLimitClosesExtraConnections() throws Exception {
+        EventLoop tiny = new EventLoop(0, 0, "Tiny", tmp.resolve("tiny"), 1000, 2);
+        Thread t = new Thread(tiny, "tiny-loop");
+        t.start();
+        try (SocketChannel c1 = SocketChannel.open(new InetSocketAddress("127.0.0.1", tiny.tcpPort()));
+             SocketChannel c2 = SocketChannel.open(new InetSocketAddress("127.0.0.1", tiny.tcpPort()));
+             SocketChannel c3 = SocketChannel.open(new InetSocketAddress("127.0.0.1", tiny.tcpPort()))) {
+            Thread.sleep(300);
+            ByteBuffer one = ByteBuffer.allocate(1);
+            assertEquals(-1, c3.read(one), "third connection must be closed by the server");
+        } finally {
+            tiny.stop();
+            t.join(5000);
+        }
+    }
+
+    @Test
+    void unknownHostAndClosedPortGiveReadableErrors() {
+        IOException e1 = assertThrows(IOException.class,
+                () -> ClientConnection.connect("no-such-host.invalid", port, "x", new Events()));
+        assertTrue(e1.getMessage().startsWith("Unknown host"), e1.getMessage());
+        IOException e2 = assertThrows(IOException.class,
+                () -> ClientConnection.connect("127.0.0.1", 1, "x", new Events()));
+        assertTrue(e2.getMessage().startsWith("Cannot connect"), e2.getMessage());
+    }
+
+    @Test
+    void secondServerOnSamePortFailsWithBindException() {
+        assertThrows(java.net.BindException.class, () -> new EventLoop(port, 0, "Dup", tmp.resolve("dup")));
     }
 
     private static byte[] sha(Path p) throws Exception {

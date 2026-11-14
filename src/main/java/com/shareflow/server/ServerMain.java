@@ -36,7 +36,7 @@ public final class ServerMain {
         } catch (java.net.BindException e) {
             System.err.println("Cannot start: port " + port + " is already in use (" + e.getMessage() + ").");
             System.err.println("Another ShareFlow server is probably already running. Stop it, or use another port:");
-            System.err.println("   mvn exec:java \"-Dexec.args=5002\"");
+            System.err.println("   mvn exec:java \"-Dexec.args=5052\"");
             System.exit(1);
             return;
         }
@@ -55,7 +55,7 @@ public final class ServerMain {
         for (NetworkInterface nif : Collections.list(NetworkInterface.getNetworkInterfaces())) {
             if (!nif.isUp() || nif.isLoopback() || nif.isVirtual()) continue;
             for (InetAddress a : Collections.list(nif.getInetAddresses())) {
-                if (a instanceof Inet4Address) {
+                if (a instanceof Inet4Address && a.isSiteLocalAddress()) {
                     System.out.println("   " + a.getHostAddress() + ":" + port + "   (" + nif.getDisplayName() + ")");
                 }
             }

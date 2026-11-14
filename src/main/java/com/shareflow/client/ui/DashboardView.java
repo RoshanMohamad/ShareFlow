@@ -4,7 +4,9 @@ import java.io.File;
 import java.time.Instant;
 import java.time.ZoneId;
 import java.time.format.DateTimeFormatter;
+import java.util.HashMap;
 import java.util.List;
+import java.util.Map;
 import java.util.Locale;
 import java.util.function.Consumer;
 
@@ -15,7 +17,6 @@ import javafx.beans.property.ReadOnlyStringWrapper;
 import javafx.collections.FXCollections;
 import javafx.collections.ObservableList;
 import javafx.collections.transformation.FilteredList;
-import javafx.concurrent.Task;
 import javafx.geometry.Insets;
 import javafx.geometry.Pos;
 import javafx.scene.Node;
@@ -44,8 +45,9 @@ import javafx.stage.Stage;
 import javafx.util.Duration;
 
 import com.shareflow.client.ClientConnection;
-import com.shareflow.client.DownloadTask;
-import com.shareflow.client.UploadTask;
+import com.shareflow.client.TransferManager;
+import com.shareflow.client.TransferManager.Snapshot;
+import com.shareflow.client.TransferManager.Transfer;
 import com.shareflow.common.FileEntry;
 import com.shareflow.common.Formats;
 import com.shareflow.common.UserInfo;
@@ -70,6 +72,8 @@ public final class DashboardView {
     private final ObservableList<String> history = FXCollections.observableArrayList();
     private final ObservableList<String> activity = FXCollections.observableArrayList();
     private final VBox transfers = new VBox(4);
+    private final TransferManager manager = new TransferManager();
+    private final Map<Transfer, TransferRow> rows = new HashMap<>(); // FX thread only
     private final Label emptyTransfers = new Label("No transfers yet. Upload a file or drop one here.");
     private final Label toast = new Label();
     private final PauseTransition toastTimer = new PauseTransition(Duration.seconds(5));
@@ -81,6 +85,7 @@ public final class DashboardView {
     public DashboardView(Stage stage, Consumer<String> onLeave) {
         this.stage = stage;
         this.onLeave = onLeave;
+        manager.setListener(snap -> Platform.runLater(() -> onTransferChanged(snap)));
         build();
     }
 
@@ -95,6 +100,7 @@ public final class DashboardView {
     }
 
     public void shutdown() {
+        manager.close();
         ClientConnection c = connection;
         if (c != null) c.close();
     }
@@ -320,7 +326,8 @@ public final class DashboardView {
     private void upload(File f) {
         ClientConnection c = connection;
         if (c == null) return;
-        addTransfer("⬆  " + f.getName(), new UploadTask(c.host(), c.port(), c.sessionId(), f.toPath()));
+        Transfer t = manager.submitUpload(c.host(), c.port(), c.sessionId(), f.toPath());
+        addRow(t, "\u2B06  " + f.getName());
     }
 
     private void download(FileEntry entry) {
@@ -330,66 +337,88 @@ public final class DashboardView {
         fc.setInitialFileName(entry.name());
         File dest = fc.showSaveDialog(stage);
         if (dest == null) return;
-        addTransfer("⬇  " + entry.name(),
-                new DownloadTask(c.host(), c.port(), c.sessionId(), entry.id(), dest.toPath()));
+        Transfer t = manager.submitDownload(c.host(), c.port(), c.sessionId(), entry.id(), entry.name(), dest.toPath());
+        addRow(t, "\u2B07  " + entry.name());
     }
 
-    private void addTransfer(String title, Task<?> task) {
-        Label name = new Label(title);
-        name.setPrefWidth(230);
-        name.setStyle("-fx-font-weight: bold;");
-        ProgressBar bar = new ProgressBar(0);
-        bar.setMaxWidth(Double.MAX_VALUE);
-        bar.progressProperty().bind(task.progressProperty());
-        HBox.setHgrow(bar, Priority.ALWAYS);
-        Label pct = new Label("0%");
-        pct.setPrefWidth(42);
-        pct.textProperty().bind(Bindings.createStringBinding(
-                () -> task.getProgress() < 0 ? "" : Math.round(task.getProgress() * 100) + "%", task.progressProperty()));
-        Label status = new Label();
-        status.getStyleClass().add("muted");
-        status.setPrefWidth(180);
-        status.textProperty().bind(task.messageProperty());
-        Button cancel = new Button("Cancel");
-        cancel.getStyleClass().addAll("button", "small");
-        cancel.setOnAction(e -> task.cancel());
-        HBox row = new HBox(12, name, bar, pct, status, cancel);
-        row.setAlignment(Pos.CENTER_LEFT);
-        row.getStyleClass().add("transfer-row");
-        transfers.getChildren().add(0, row);
+    /** One line in the Transfers tab. */
+    private final class TransferRow {
+        final String title;
+        final HBox box;
+        final ProgressBar bar = new ProgressBar(0);
+        final Label pct = new Label("0%");
+        final Label status = new Label("Queued");
+        final Button cancel = new Button("Cancel");
+        boolean reported;
+
+        TransferRow(String title, Transfer t) {
+            this.title = title;
+            Label name = new Label(title);
+            name.setPrefWidth(230);
+            name.setStyle("-fx-font-weight: bold;");
+            bar.setMaxWidth(Double.MAX_VALUE);
+            HBox.setHgrow(bar, Priority.ALWAYS);
+            pct.setPrefWidth(42);
+            status.getStyleClass().add("muted");
+            status.setPrefWidth(260);
+            cancel.getStyleClass().addAll("button", "small");
+            cancel.setOnAction(e -> manager.cancel(t));
+            box = new HBox(12, name, bar, pct, status, cancel);
+            box.setAlignment(Pos.CENTER_LEFT);
+            box.getStyleClass().add("transfer-row");
+        }
+
+        void update(Snapshot s) {
+            switch (s.state()) {
+                case QUEUED -> bar.setProgress(0);
+                case RUNNING -> bar.setProgress(s.total() > 0 ? s.fraction() : ProgressBar.INDETERMINATE_PROGRESS);
+                case SUCCEEDED -> { bar.setProgress(1); bar.getStyleClass().add("done"); }
+                case FAILED -> { bar.setProgress(0.0001); bar.getStyleClass().add("failed"); }
+                case CANCELLED -> bar.setProgress(0.0001);
+            }
+            pct.setText(s.state() == TransferManager.State.RUNNING && s.total() > 0
+                    ? Math.round(s.fraction() * 100) + "%" : (s.state() == TransferManager.State.SUCCEEDED ? "100%" : ""));
+            String text = s.message();
+            if (s.state() == TransferManager.State.RUNNING && s.total() > 0 && !text.endsWith("...")) {
+                text = Formats.size(s.done()) + " / " + Formats.size(s.total());
+            } else if (s.state() == TransferManager.State.RUNNING && s.total() > 0) {
+                text = text + "  " + Formats.size(s.done()) + " / " + Formats.size(s.total());
+            }
+            status.setText(text);
+            cancel.setDisable(s.finished());
+        }
+    }
+
+    private void addRow(Transfer t, String title) {
+        TransferRow row = new TransferRow(title, t);
+        rows.put(t, row);
+        transfers.getChildren().add(0, row.box);
         emptyTransfers.setVisible(false);
         emptyTransfers.setManaged(false);
+        // the manager may already have reported progress before the row existed
+        manager.snapshot().stream().filter(s -> s.transfer() == t).findFirst().ifPresent(s -> onTransferChanged(s));
+    }
 
-        task.setOnSucceeded(e -> {
-            status.textProperty().unbind();
-            status.setText("Done at " + TIME.format(Instant.now()));
-            bar.getStyleClass().add("done");
-            cancel.setDisable(true);
-            history.add(0, TIME.format(Instant.now()) + "  " + title + "  - completed");
-            announce("✅ " + title.substring(3) + " finished");
-        });
-        task.setOnFailed(e -> {
-            String msg = task.getException().getMessage();
-            status.textProperty().unbind();
-            bar.progressProperty().unbind();
-            bar.setProgress(0.0001);
-            bar.getStyleClass().add("failed");
-            pct.textProperty().unbind();
-            pct.setText("");
-            status.setText("Failed: " + msg);
-            cancel.setDisable(true);
-            history.add(0, TIME.format(Instant.now()) + "  " + title + "  - failed: " + msg);
-            announce("❌ " + title.substring(3) + " failed: " + msg);
-        });
-        task.setOnCancelled(e -> {
-            status.textProperty().unbind();
-            status.setText("Cancelled");
-            cancel.setDisable(true);
-            history.add(0, TIME.format(Instant.now()) + "  " + title + "  - cancelled");
-        });
-        Thread t = new Thread(task, "shareflow-transfer");
-        t.setDaemon(true);
-        t.start();
+    private void onTransferChanged(Snapshot s) {
+        TransferRow row = rows.get(s.transfer());
+        if (row == null) return;
+        row.update(s);
+        if (s.finished() && !row.reported) {
+            row.reported = true;
+            String time = TIME.format(Instant.now());
+            String what = row.title.substring(3);
+            switch (s.state()) {
+                case SUCCEEDED -> {
+                    history.add(0, time + "  " + row.title + "  - " + s.message());
+                    announce("\u2705 " + what + " - " + s.message());
+                }
+                case FAILED -> {
+                    history.add(0, time + "  " + row.title + "  - failed: " + s.message());
+                    announce("\u274C " + what + " failed: " + s.message());
+                }
+                default -> history.add(0, time + "  " + row.title + "  - cancelled");
+            }
+        }
     }
 
     /** Shows a toast and records the event in the activity log. */

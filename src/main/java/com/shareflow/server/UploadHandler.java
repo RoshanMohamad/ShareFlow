@@ -4,15 +4,20 @@ import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.FileChannel;
 import java.nio.file.StandardOpenOption;
+import java.security.MessageDigest;
 
 import com.shareflow.common.FileEntry;
 import com.shareflow.common.Formats;
+import com.shareflow.common.Hashing;
 import com.shareflow.common.MessageType;
 import com.shareflow.common.Payload;
+import com.shareflow.common.ProtocolConstants;
 
 /**
  * Server side of an upload: socket bytes go through a {@link ByteBuffer} into a
- * {@code name.part} {@link FileChannel}; the file is renamed only when all bytes arrived.
+ * {@code name.part} {@link FileChannel} while a {@link MessageDigest} hashes every chunk.
+ * The file is renamed only when all bytes arrived and the SHA-256 matches the one the
+ * client announced.
  *
  * @author Member 3
  */
@@ -25,15 +30,23 @@ final class UploadHandler {
         int sessionId = r.readInt();
         String fileName = r.readString();
         long size = r.readLong();
+        byte[] hash = r.readBytes(ProtocolConstants.HASH_LENGTH);
 
         ConnectionContext owner = loop.registry().bySession(sessionId);
         if (owner == null) { reject(loop, ctx, "Unknown session"); return; }
         if (size < 0) { reject(loop, ctx, "Invalid file size"); return; }
+        if (size > loop.maxFileSize()) {
+            reject(loop, ctx, "File too large (limit " + Formats.size(loop.maxFileSize()) + ")");
+            ServerMain.log(owner.username + " tried to upload " + Formats.size(size) + " - rejected");
+            return;
+        }
 
         FileRepository.Reservation res = loop.repository().reserve(fileName);
         ctx.reservation = res;
         ctx.uploader = owner.username;
         ctx.uploadChannel = FileChannel.open(res.partPath(), StandardOpenOption.WRITE);
+        ctx.uploadDigest = Hashing.sha256();
+        ctx.expectedHash = hash;
         ctx.uploadRemaining = size;
         ctx.uploadTotal = size;
         ctx.state = ConnectionContext.State.UPLOADING;
@@ -48,6 +61,7 @@ final class UploadHandler {
         if (buf.remaining() > ctx.uploadRemaining) {
             buf.limit(buf.position() + (int) ctx.uploadRemaining); // ignore surplus bytes
         }
+        ctx.uploadDigest.update(buf.duplicate());
         while (buf.hasRemaining()) {
             ctx.uploadRemaining -= ctx.uploadChannel.write(buf);
         }
@@ -64,9 +78,21 @@ final class UploadHandler {
         ctx.uploadChannel.close();
         ctx.uploadChannel = null;
         FileRepository.Reservation res = ctx.reservation;
-        FileEntry entry = loop.repository().commit(res, ctx.uploader);
+
+        byte[] actual = ctx.uploadDigest.digest();
+        if (!MessageDigest.isEqual(actual, ctx.expectedHash)) {
+            loop.repository().discard(res);
+            ctx.reservation = null;
+            ServerMain.log("Upload of '" + res.finalName() + "' by " + ctx.uploader
+                    + " failed the SHA-256 check - removed");
+            reject(loop, ctx, "Integrity check failed: the file was corrupted in transfer");
+            return;
+        }
+
+        FileEntry entry = loop.repository().commit(res, ctx.uploader, actual);
         ctx.reservation = null;
-        ServerMain.log(ctx.uploader + " uploaded '" + entry.name() + "' (" + Formats.size(entry.size()) + ")");
+        ServerMain.log(ctx.uploader + " uploaded '" + entry.name() + "' (" + Formats.size(entry.size())
+                + ", SHA-256 verified)");
 
         loop.broadcaster().send(ctx, MessageType.UPLOAD_DONE, Payload.writer().writeInt(entry.id()).toBytes());
         ctx.closeAfterFlush();

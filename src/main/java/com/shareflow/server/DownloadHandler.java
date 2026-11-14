@@ -49,7 +49,7 @@ final class DownloadHandler {
         ctx.uploader = owner.username; // reused as "who" for logging
         ctx.state = ConnectionContext.State.DOWNLOADING;
         loop.broadcaster().send(ctx, MessageType.DOWNLOAD_START,
-                Payload.writer().writeLong(ctx.downloadSize).toBytes());
+                Payload.writer().writeLong(ctx.downloadSize).writeBytes(entry.sha256()).toBytes());
         ServerMain.log(owner.username + " downloading '" + entry.name() + "' (" + Formats.size(ctx.downloadSize) + ")");
     }
 

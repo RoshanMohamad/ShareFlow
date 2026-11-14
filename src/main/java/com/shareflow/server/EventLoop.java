@@ -31,9 +31,19 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private final FileRepository repository;
     private final ClientRegistry registry = new ClientRegistry();
     private final Broadcaster broadcaster = new Broadcaster(registry);
+    private final long maxFileSize;
+    private final int maxConnections;
+    private int connections;
     private volatile boolean running = true;
 
     public EventLoop(int tcpPort, int udpPort, String serverName, Path sharedDir) throws IOException {
+        this(tcpPort, udpPort, serverName, sharedDir, ProtocolConstants.MAX_FILE_SIZE, ProtocolConstants.MAX_CONNECTIONS);
+    }
+
+    public EventLoop(int tcpPort, int udpPort, String serverName, Path sharedDir,
+                     long maxFileSize, int maxConnections) throws IOException {
+        this.maxFileSize = maxFileSize;
+        this.maxConnections = maxConnections;
         repository = new FileRepository(sharedDir);
         selector = Selector.open();
         serverChannel = ServerSocketChannel.open();
@@ -52,6 +62,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
         try { return serverChannel.getLocalAddress(); } catch (IOException e) { throw new IllegalStateException(e); }
     }
 
+    long maxFileSize() { return maxFileSize; }
     FileRepository repository() { return repository; }
     ClientRegistry registry() { return registry; }
     Broadcaster broadcaster() { return broadcaster; }
@@ -103,6 +114,13 @@ public final class EventLoop implements Runnable, AutoCloseable {
     private void accept() throws IOException {
         SocketChannel ch;
         while ((ch = serverChannel.accept()) != null) {
+            if (connections >= maxConnections) { // DoS protection
+                ServerMain.log("Connection limit (" + maxConnections + ") reached - refusing "
+                        + ch.getRemoteAddress());
+                ch.close();
+                continue;
+            }
+            connections++;
             ch.configureBlocking(false);
             ch.setOption(StandardSocketOptions.TCP_NODELAY, true);
             SelectionKey key = ch.register(selector, SelectionKey.OP_READ);
@@ -216,6 +234,7 @@ public final class EventLoop implements Runnable, AutoCloseable {
     void close(ConnectionContext ctx, String reason) {
         if (ctx.closed) return;
         ctx.closed = true;
+        connections--;
         ctx.key.cancel();
         try { ctx.channel.close(); } catch (IOException ignored) { }
 

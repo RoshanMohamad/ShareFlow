@@ -12,6 +12,7 @@ import java.util.Map;
 import java.util.stream.Stream;
 
 import com.shareflow.common.FileEntry;
+import com.shareflow.common.Hashing;
 
 /**
  * The shared/ folder and its index. Handles name sanitising, duplicate names and the
@@ -45,7 +46,7 @@ public final class FileRepository {
                     continue;
                 }
                 FileEntry e = new FileEntry(nextId++, Files.size(p), name, "server",
-                        Files.getLastModifiedTime(p).toMillis());
+                        Files.getLastModifiedTime(p).toMillis(), Hashing.sha256(p));
                 entries.put(e.id(), e);
             }
         }
@@ -94,14 +95,14 @@ public final class FileRepository {
     }
 
     /** Renames .part to the final name and indexes the file. */
-    public FileEntry commit(Reservation r, String uploader) throws IOException {
+    public FileEntry commit(Reservation r, String uploader, byte[] sha256) throws IOException {
         try {
             Files.move(r.partPath(), r.finalPath(), StandardCopyOption.ATOMIC_MOVE);
         } catch (AtomicMoveNotSupportedException e) {
             Files.move(r.partPath(), r.finalPath(), StandardCopyOption.REPLACE_EXISTING);
         }
         FileEntry e = new FileEntry(nextId++, Files.size(r.finalPath()), r.finalName(), uploader,
-                System.currentTimeMillis());
+                System.currentTimeMillis(), sha256);
         entries.put(e.id(), e);
         return e;
     }

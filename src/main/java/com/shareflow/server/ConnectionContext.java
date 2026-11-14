@@ -49,6 +49,8 @@ public final class ConnectionContext {
     String uploader;
     long uploadRemaining;
     long uploadTotal;
+    java.security.MessageDigest uploadDigest;
+    byte[] expectedHash;
 
     // download state
     FileChannel downloadChannel;

@@ -1,8 +1,12 @@
 package com.shareflow.client;
 
+import java.io.BufferedInputStream;
+import java.io.BufferedOutputStream;
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.net.InetSocketAddress;
-import java.nio.channels.SocketChannel;
+import java.net.Socket;
 import java.util.ArrayList;
 import java.util.List;
 
@@ -11,13 +15,16 @@ import com.shareflow.common.Frame;
 import com.shareflow.common.FrameCodec;
 import com.shareflow.common.MessageType;
 import com.shareflow.common.Payload;
+import com.shareflow.common.ProtocolConstants;
 import com.shareflow.common.UserInfo;
 
 /**
- * The long-lived control connection. {@link #connect} performs the HELLO/WELCOME
- * handshake synchronously, then a background thread reads frames and reports them to
- * the {@link Listener}. Listener callbacks run on that background thread, so UI code
- * must hop to the JavaFX thread with {@code Platform.runLater}.
+ * The long-lived control connection, built on a blocking {@link Socket}.
+ * <p>
+ * Lifecycle: connect (with timeout) -> open streams -> HELLO/WELCOME handshake -> a
+ * control-reader thread receives server messages -> close. Listener callbacks run on
+ * the reader thread, so UI code must hop to the JavaFX thread with
+ * {@code Platform.runLater}.
  *
  * @author Member 1
  */
@@ -34,7 +41,9 @@ public final class ClientConnection implements AutoCloseable {
         default void onDisconnected(String reason) {}
     }
 
-    private final SocketChannel channel;
+    private final Socket socket;
+    private final DataInputStream in;
+    private final DataOutputStream out;
     private final String host;
     private final int port;
     private final String username;
@@ -42,9 +51,11 @@ public final class ClientConnection implements AutoCloseable {
     private final Listener listener;
     private volatile boolean closing;
 
-    private ClientConnection(SocketChannel channel, String host, int port, String username,
-                             int sessionId, Listener listener) {
-        this.channel = channel;
+    private ClientConnection(Socket socket, DataInputStream in, DataOutputStream out, String host, int port,
+                             String username, int sessionId, Listener listener) {
+        this.socket = socket;
+        this.in = in;
+        this.out = out;
         this.host = host;
         this.port = port;
         this.username = username;
@@ -55,16 +66,21 @@ public final class ClientConnection implements AutoCloseable {
     /**
      * Connects and logs in.
      *
-     * @throws IOException if the server is unreachable or rejects the username
+     * @throws IOException with a readable message if the host is unknown, unreachable,
+     *                     times out, or the server rejects the username
      */
     public static ClientConnection connect(String host, int port, String username, Listener listener)
             throws IOException {
-        SocketChannel ch = SocketChannel.open();
+        Socket socket = new Socket();
         try {
-            ch.socket().connect(new InetSocketAddress(host, port), 5000);
-            ch.socket().setTcpNoDelay(true);
-            FrameCodec.writeFrame(ch, MessageType.HELLO, Payload.writer().writeString(username).toBytes());
-            Frame reply = FrameCodec.readFrame(ch);
+            socket.connect(new InetSocketAddress(host, port), ProtocolConstants.CONNECT_TIMEOUT_MS);
+            socket.setTcpNoDelay(true);
+            socket.setSoTimeout(ProtocolConstants.CONNECT_TIMEOUT_MS); // handshake must not hang
+            DataInputStream in = new DataInputStream(new BufferedInputStream(socket.getInputStream()));
+            DataOutputStream out = new DataOutputStream(new BufferedOutputStream(socket.getOutputStream()));
+
+            FrameCodec.writeFrame(out, MessageType.HELLO, Payload.writer().writeString(username).toBytes());
+            Frame reply = FrameCodec.readFrame(in);
             if (reply.type() == MessageType.ERROR) {
                 throw new IOException(new Payload.Reader(reply.payload()).readString());
             }
@@ -72,13 +88,18 @@ public final class ClientConnection implements AutoCloseable {
                 throw new IOException("Unexpected reply " + reply.type());
             }
             int sessionId = new Payload.Reader(reply.payload()).readInt();
-            ClientConnection c = new ClientConnection(ch, host, port, username, sessionId, listener);
+            socket.setSoTimeout(0); // reader thread blocks until the server speaks
+
+            ClientConnection c = new ClientConnection(socket, in, out, host, port, username, sessionId, listener);
             Thread t = new Thread(c::readLoop, "shareflow-control-reader");
             t.setDaemon(true);
             t.start();
             return c;
-        } catch (IOException | RuntimeException e) {
-            try { ch.close(); } catch (IOException ignored) { }
+        } catch (IOException e) {
+            try { socket.close(); } catch (IOException ignored) { }
+            throw NetErrors.friendly(e, host, port);
+        } catch (RuntimeException e) {
+            try { socket.close(); } catch (IOException ignored) { }
             throw e;
         }
     }
@@ -87,7 +108,7 @@ public final class ClientConnection implements AutoCloseable {
         String reason = "Connection lost";
         try {
             while (true) {
-                dispatch(FrameCodec.readFrame(channel));
+                dispatch(FrameCodec.readFrame(in));
             }
         } catch (IOException e) {
             if (closing) return;
@@ -121,7 +142,7 @@ public final class ClientConnection implements AutoCloseable {
     }
 
     public synchronized void requestFileList() throws IOException {
-        FrameCodec.writeFrame(channel, MessageType.LIST_FILES, new byte[0]);
+        FrameCodec.writeFrame(out, MessageType.LIST_FILES, new byte[0]);
     }
 
     public String host() { return host; }
@@ -132,7 +153,7 @@ public final class ClientConnection implements AutoCloseable {
     @Override
     public synchronized void close() {
         closing = true;
-        try { FrameCodec.writeFrame(channel, MessageType.BYE, new byte[0]); } catch (IOException ignored) { }
-        try { channel.close(); } catch (IOException ignored) { }
+        try { FrameCodec.writeFrame(out, MessageType.BYE, new byte[0]); } catch (IOException ignored) { }
+        try { socket.close(); } catch (IOException ignored) { }
     }
 }

@@ -1,5 +1,7 @@
 package com.shareflow.common;
 
+import java.io.DataInputStream;
+import java.io.DataOutputStream;
 import java.io.IOException;
 import java.nio.ByteBuffer;
 import java.nio.channels.ReadableByteChannel;
@@ -40,13 +42,15 @@ public final class FrameCodec {
         acc.flip();
         try {
             if (acc.remaining() < ProtocolConstants.HEADER_SIZE) return null;
-            int pos = acc.position();
-            byte code = acc.get(pos);
-            int len = acc.getInt(pos + 1);
+            acc.mark();
+            byte code = acc.get();
+            int len = acc.getInt();
             if (len < 0 || len > maxPayload) throw new IOException("Frame too large: " + len);
-            if (acc.remaining() < ProtocolConstants.HEADER_SIZE + len) return null;
+            if (acc.remaining() < len) {
+                acc.reset(); // frame incomplete: keep every byte for the next read
+                return null;
+            }
             MessageType type = MessageType.fromCode(code);
-            acc.position(pos + ProtocolConstants.HEADER_SIZE);
             byte[] payload = new byte[len];
             acc.get(payload);
             return new Frame(type, payload);
@@ -55,7 +59,24 @@ public final class FrameCodec {
         }
     }
 
-    /** Blocking read of one frame (client side). */
+    /** Client side (java.net): blocks until the whole frame has arrived. */
+    public static Frame readFrame(DataInputStream in) throws IOException {
+        byte code = in.readByte();
+        int len = in.readInt();
+        if (len < 0 || len > ProtocolConstants.MAX_CLIENT_PAYLOAD) throw new IOException("Bad frame length " + len);
+        byte[] payload = new byte[len];
+        in.readFully(payload);
+        return new Frame(MessageType.fromCode(code), payload);
+    }
+
+    public static void writeFrame(DataOutputStream out, MessageType type, byte[] payload) throws IOException {
+        out.writeByte(type.code);
+        out.writeInt(payload.length);
+        out.write(payload);
+        out.flush();
+    }
+
+    /** Blocking read of one frame from a channel. */
     public static Frame readFrame(ReadableByteChannel ch) throws IOException {
         ByteBuffer header = ByteBuffer.allocate(ProtocolConstants.HEADER_SIZE);
         readFully(ch, header);

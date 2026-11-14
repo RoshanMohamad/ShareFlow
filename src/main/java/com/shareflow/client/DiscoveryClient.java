@@ -17,13 +17,13 @@ import java.util.Set;
 import com.shareflow.common.ProtocolConstants;
 
 /**
- * Finds ShareFlow servers on the LAN: broadcasts {@code SHAREFLOW_DISCOVER} over UDP and
- * collects replies for two seconds.
+ * Finds ShareFlow servers on the LAN. UDP gives no delivery guarantee, so the broadcast
+ * {@code SHAREFLOW_DISCOVER} is sent up to 3 times, waiting 1 second for replies after
+ * each one, and every distinct server that answers is listed.
  *
  * @author Member 5
  */
 public final class DiscoveryClient {
-    private static final int TIMEOUT_MS = 2000;
 
     public record ServerInfo(String host, int port, String name) {
         @Override
@@ -40,34 +40,44 @@ public final class DiscoveryClient {
     public static List<ServerInfo> discover(int udpPort, boolean includeLoopback) throws IOException {
         List<ServerInfo> found = new ArrayList<>();
         Set<String> seen = new LinkedHashSet<>();
+        byte[] probe = ProtocolConstants.DISCOVER_MESSAGE.getBytes(StandardCharsets.UTF_8);
+
         try (DatagramSocket socket = new DatagramSocket()) {
             socket.setBroadcast(true);
-            byte[] probe = ProtocolConstants.DISCOVER_MESSAGE.getBytes(StandardCharsets.UTF_8);
-            for (InetAddress target : targets(includeLoopback)) {
-                try {
-                    socket.send(new DatagramPacket(probe, probe.length, target, udpPort));
-                } catch (IOException ignored) {
-                    // this interface may not allow broadcast; try the others
-                }
-            }
+            List<InetAddress> targets = targets(includeLoopback);
 
-            long deadline = System.currentTimeMillis() + TIMEOUT_MS;
-            byte[] buf = new byte[512];
-            while (true) {
-                int left = (int) (deadline - System.currentTimeMillis());
-                if (left <= 0) break;
-                socket.setSoTimeout(left);
-                DatagramPacket p = new DatagramPacket(buf, buf.length);
-                try {
-                    socket.receive(p);
-                } catch (SocketTimeoutException e) {
-                    break;
+            for (int attempt = 1; attempt <= ProtocolConstants.DISCOVERY_ATTEMPTS; attempt++) {
+                for (InetAddress target : targets) {
+                    try {
+                        socket.send(new DatagramPacket(probe, probe.length, target, udpPort));
+                    } catch (IOException ignored) {
+                        // this interface may not allow broadcast; try the others
+                    }
                 }
-                ServerInfo info = parse(p);
-                if (info != null && seen.add(info.host() + ":" + info.port())) found.add(info);
+                collectReplies(socket, found, seen);
+                if (!found.isEmpty()) break; // no need to retry once someone answered
             }
         }
         return found;
+    }
+
+    private static void collectReplies(DatagramSocket socket, List<ServerInfo> found, Set<String> seen)
+            throws IOException {
+        long deadline = System.currentTimeMillis() + ProtocolConstants.DISCOVERY_WAIT_MS;
+        byte[] buf = new byte[512];
+        while (true) {
+            int left = (int) (deadline - System.currentTimeMillis());
+            if (left <= 0) return;
+            socket.setSoTimeout(left);
+            DatagramPacket p = new DatagramPacket(buf, buf.length);
+            try {
+                socket.receive(p);
+            } catch (SocketTimeoutException e) {
+                return;
+            }
+            ServerInfo info = parse(p);
+            if (info != null && seen.add(info.host() + ":" + info.port())) found.add(info);
+        }
     }
 
     private static ServerInfo parse(DatagramPacket p) {
