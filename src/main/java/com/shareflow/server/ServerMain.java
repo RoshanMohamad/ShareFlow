@@ -30,7 +30,16 @@ public final class ServerMain {
         String name = args.length > 1 ? args[1] : hostName();
         Path shared = Path.of(args.length > 2 ? args[2] : "shared");
 
-        EventLoop loop = new EventLoop(port, ProtocolConstants.DISCOVERY_PORT, name, shared);
+        EventLoop loop;
+        try {
+            loop = new EventLoop(port, ProtocolConstants.DISCOVERY_PORT, name, shared);
+        } catch (java.net.BindException e) {
+            System.err.println("Cannot start: port " + port + " is already in use (" + e.getMessage() + ").");
+            System.err.println("Another ShareFlow server is probably already running. Stop it, or use another port:");
+            System.err.println("   mvn exec:java \"-Dexec.args=5002\"");
+            System.exit(1);
+            return;
+        }
         System.out.println("=== ShareFlow Server '" + name + "' ===");
         System.out.println("Shared folder : " + shared.toAbsolutePath());
         System.out.println("TCP port      : " + loop.tcpPort() + "   UDP discovery port: " + ProtocolConstants.DISCOVERY_PORT);
