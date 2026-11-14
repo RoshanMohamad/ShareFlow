@@ -16,8 +16,10 @@ mvn test          # framing tests + loopback server integration tests
 ## Run the server
 ```
 mvn exec:java                              # port 5000, folder ./shared
-mvn exec:java -Dexec.args="5000 LabServer shared"
+mvn exec:java -Dexec.args="5000 LabServer shared"      # cmd / bash
+mvn exec:java "-Dexec.args=5000 LabServer shared"      # PowerShell (quote the whole option)
 ```
+Arguments are `[tcpPort] [serverName] [sharedDir]`; all are optional.
 The server prints its LAN IP addresses, joins, uploads and downloads.
 
 ## Run the client
