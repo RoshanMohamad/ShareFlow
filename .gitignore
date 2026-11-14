@@ -1,0 +1,8 @@
+target/
+.idea/
+shared/
+*.class
+*.iml
+claude.mdclaude.md
+CLAUDE.md
+shared-ui/
